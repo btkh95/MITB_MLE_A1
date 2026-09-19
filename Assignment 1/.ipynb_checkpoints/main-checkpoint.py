@@ -17,9 +17,6 @@ import utils.data_processing_bronze_table
 import utils.data_processing_silver_table
 import utils.data_processing_gold_table
 
-from pathlib import Path
-import yaml
-
 
 # Initialize SparkSession
 spark = pyspark.sql.SparkSession.builder \
@@ -63,11 +60,8 @@ def generate_first_of_month_dates(start_date_str, end_date_str):
 dates_str_lst = generate_first_of_month_dates(start_date_str, end_date_str)
 print(dates_str_lst)
 
-bronze_subdir = ["fe_click", "fe_attr", "fe_fin"]
-
 # create bronze datalake
-for bronze_subdir in subdirs:
- bronze_directory = "datamart/bronze/" + bronze_subdir +"lms/"
+bronze_lms_directory = "datamart/bronze/lms/"
 
 if not os.path.exists(bronze_lms_directory):
     os.makedirs(bronze_lms_directory)
