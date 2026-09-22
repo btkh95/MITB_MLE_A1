@@ -16,10 +16,9 @@ from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
 import utils.data_processing_bronze_table
 import utils.data_processing_silver_table
 import utils.data_processing_gold_table
+from utils.check_data_files import check_data_files
 
-from pathlib import Path
 import yaml
-
 
 # Initialize SparkSession
 spark = pyspark.sql.SparkSession.builder \
@@ -63,18 +62,29 @@ def generate_first_of_month_dates(start_date_str, end_date_str):
 dates_str_lst = generate_first_of_month_dates(start_date_str, end_date_str)
 print(dates_str_lst)
 
-bronze_subdir = ["fe_click", "fe_attr", "fe_fin"]
+with open("static/dir.yaml") as file:
+    config = yaml.safe_load(file)
+
+check_data_files(config)
 
 # create bronze datalake
-for bronze_subdir in subdirs:
- bronze_directory = "datamart/bronze/" + bronze_subdir +"lms/"
+for bronze_subdir in config["bronze"]["datasets"]:
+    bronze_directory = "datamart/bronze/" + bronze_subdir + "/"
 
-if not os.path.exists(bronze_lms_directory):
-    os.makedirs(bronze_lms_directory)
+    if not os.path.exists(bronze_directory):
+        os.makedirs(bronze_directory)
+
+bronze_lms_directory = "datamart/bronze/lms/"
 
 # run bronze backfill
-for date_str in dates_str_lst:
-    utils.data_processing_bronze_table.process_bronze_table(date_str, bronze_lms_directory, spark)
+for bronze_subdir in config["bronze"]["datasets"]:
+    csv_file_path = "data/" + config["bronze"]["datasets"][bronze_subdir]["filename"]
+    bronze_directory = "datamart/bronze/" + bronze_subdir + "/"
+
+    for date_str in dates_str_lst:
+        utils.data_processing_bronze_table.process_bronze_table(
+            date_str, csv_file_path, bronze_directory, spark
+        )
 
 
 # create silver datalake
