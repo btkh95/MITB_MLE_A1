@@ -62,12 +62,17 @@ def generate_first_of_month_dates(start_date_str, end_date_str):
 dates_str_lst = generate_first_of_month_dates(start_date_str, end_date_str)
 print(dates_str_lst)
 
+# read in config file for directories and filenames
 with open("static/dir.yaml") as file:
     config = yaml.safe_load(file)
 
 check_data_files(config)
 
-# create bronze datalake
+##########
+# Bronze #
+##########
+
+# create bronze datalake - loop through all bronze datasets in config file
 for bronze_subdir in config["bronze"]["datasets"]:
     bronze_directory = "datamart/bronze/" + bronze_subdir + "/"
 
@@ -86,6 +91,9 @@ for bronze_subdir in config["bronze"]["datasets"]:
             date_str, csv_file_path, bronze_directory, spark
         )
 
+##########
+# Silver #
+##########
 
 # create silver datalake
 silver_loan_daily_directory = "datamart/silver/loan_daily/"
@@ -95,8 +103,14 @@ if not os.path.exists(silver_loan_daily_directory):
 
 # run silver backfill
 for date_str in dates_str_lst:
+    utils.data_processing_silver_table.process_lms_silver_table(date_str, bronze_lms_directory, silver_loan_daily_directory, spark)
+    utils.data_processing_silver_table.process_fe_attr_silver_table(date_str, bronze_fe_attr_directory, silver_fe_attr_directory, spark)
+    utils.data_processing_silver_table.process_silver_table(date_str, bronze_lms_directory, silver_loan_daily_directory, spark)
     utils.data_processing_silver_table.process_silver_table(date_str, bronze_lms_directory, silver_loan_daily_directory, spark)
 
+########
+# Gold #
+########
 
 # create gold datalake
 gold_label_store_directory = "datamart/gold/label_store/"
