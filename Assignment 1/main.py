@@ -80,6 +80,9 @@ for bronze_subdir in config["bronze"]["datasets"]:
         os.makedirs(bronze_directory)
 
 bronze_lms_directory = "datamart/bronze/lms/"
+bronze_fe_attr_directory = "datamart/bronze/fe_attr/"
+bronze_fe_fin_directory = "datamart/bronze/fe_fin/"
+bronze_fe_click_directory = "datamart/bronze/fe_click/"
 
 # run bronze backfill
 for bronze_subdir in config["bronze"]["datasets"]:
@@ -97,16 +100,21 @@ for bronze_subdir in config["bronze"]["datasets"]:
 
 # create silver datalake
 silver_loan_daily_directory = "datamart/silver/loan_daily/"
+silver_fe_attr_directory = "datamart/silver/fe_attr/"
+silver_fe_fin_directory = "datamart/silver/fe_fin/"
+silver_fe_click_directory = "datamart/silver/fe_click/"
 
-if not os.path.exists(silver_loan_daily_directory):
-    os.makedirs(silver_loan_daily_directory)
+for silver_directory in [silver_loan_daily_directory, silver_fe_attr_directory,
+                         silver_fe_fin_directory, silver_fe_click_directory]:
+    if not os.path.exists(silver_directory):
+        os.makedirs(silver_directory)
 
 # run silver backfill
 for date_str in dates_str_lst:
     utils.data_processing_silver_table.process_lms_silver_table(date_str, bronze_lms_directory, silver_loan_daily_directory, spark)
     utils.data_processing_silver_table.process_fe_attr_silver_table(date_str, bronze_fe_attr_directory, silver_fe_attr_directory, spark)
-    utils.data_processing_silver_table.process_silver_table(date_str, bronze_lms_directory, silver_loan_daily_directory, spark)
-    utils.data_processing_silver_table.process_silver_table(date_str, bronze_lms_directory, silver_loan_daily_directory, spark)
+    utils.data_processing_silver_table.process_fe_fin_silver_table(date_str, bronze_fe_fin_directory, silver_fe_fin_directory, spark)
+    utils.data_processing_silver_table.process_fe_click_silver_table(date_str, bronze_fe_click_directory, silver_fe_click_directory, spark)
 
 ########
 # Gold #
@@ -124,11 +132,14 @@ for date_str in dates_str_lst:
 
 
 folder_path = gold_label_store_directory
-files_list = [folder_path+os.path.basename(f) for f in glob.glob(os.path.join(folder_path, '*'))]
+files_list = [folder_path+os.path.basename(f) for f in glob.glob(os.path.join(folder_path, 'gold_label_store_*.parquet'))]
 df = spark.read.option("header", "true").parquet(*files_list)
 print("row_count:",df.count())
 
 df.show()
+
+# end spark session
+spark.stop()
 
 
 
