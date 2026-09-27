@@ -16,6 +16,7 @@ from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
 import utils.data_processing_bronze_table
 import utils.data_processing_silver_table
 import utils.data_processing_gold_table
+import utils.data_processing_model_data
 from utils.check_data_files import check_data_files
 
 import yaml
@@ -122,12 +123,13 @@ for date_str in dates_str_lst:
 
 # create gold datalake
 gold_label_store_directory = "datamart/gold/label_store/"
-gold_fe_attr_directory = "datamart/gold/fe_attr/"
-gold_fe_fin_directory = "datamart/gold/fe_fin/"
-gold_fe_click_directory = "datamart/gold/fe_click/"
+gold_feature_store_directory = "datamart/gold/feature_store/"
+gold_fe_attr_directory = gold_feature_store_directory + "fe_attr/"
+gold_fe_fin_directory = gold_feature_store_directory + "fe_fin/"
+gold_fe_click_directory = gold_feature_store_directory + "fe_click/"
 
-for gold_directory in [gold_label_store_directory, gold_fe_attr_directory,
-                       gold_fe_fin_directory, gold_fe_click_directory]:
+for gold_directory in [gold_label_store_directory, gold_feature_store_directory,
+                       gold_fe_attr_directory, gold_fe_fin_directory, gold_fe_click_directory]:
     if not os.path.exists(gold_directory):
         os.makedirs(gold_directory)
 
@@ -138,6 +140,16 @@ for date_str in dates_str_lst:
     utils.data_processing_gold_table.process_fe_fin_gold_table(date_str, silver_fe_fin_directory, gold_fe_fin_directory, spark)
     utils.data_processing_gold_table.process_fe_click_gold_table(date_str, silver_fe_click_directory, gold_fe_click_directory, spark)
 
+# assemble the feature store after every monthly feature partition is available
+utils.data_processing_gold_table.process_features_gold_table(gold_feature_store_directory, spark)
+
+# Decision: keep main.py as the pipeline orchestrator. Use the latest 20% of
+# application months for OOT; stratify an 80/20 train/test split on older loans.
+# The helper uses training means (including clickstream means from clickers),
+# training medians, one-hot encoding and StandardScaler() on train only.
+utils.data_processing_model_data.process_model_splits(
+    gold_feature_store_directory, gold_label_store_directory,
+    "datamart/gold/post_split/", spark, oot_fraction=0.2, test_size=0.2, random_state=55)
 
 folder_path = gold_label_store_directory
 files_list = [folder_path+os.path.basename(f) for f in glob.glob(os.path.join(folder_path, 'gold_label_store_*.parquet'))]

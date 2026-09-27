@@ -1,3 +1,5 @@
 # Generated data files and Spark Parquet output directories
 *.csv
 *.parquet
+datamart/
+__pycache__/
