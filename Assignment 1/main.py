@@ -122,13 +122,21 @@ for date_str in dates_str_lst:
 
 # create gold datalake
 gold_label_store_directory = "datamart/gold/label_store/"
+gold_fe_attr_directory = "datamart/gold/fe_attr/"
+gold_fe_fin_directory = "datamart/gold/fe_fin/"
+gold_fe_click_directory = "datamart/gold/fe_click/"
 
-if not os.path.exists(gold_label_store_directory):
-    os.makedirs(gold_label_store_directory)
+for gold_directory in [gold_label_store_directory, gold_fe_attr_directory,
+                       gold_fe_fin_directory, gold_fe_click_directory]:
+    if not os.path.exists(gold_directory):
+        os.makedirs(gold_directory)
 
 # run gold backfill
 for date_str in dates_str_lst:
-    utils.data_processing_gold_table.process_labels_gold_table(date_str, silver_loan_daily_directory, gold_label_store_directory, spark, dpd = 30, mob = 6)
+    utils.data_processing_gold_table.process_lms_gold_table(date_str, silver_loan_daily_directory, gold_label_store_directory, spark, dpd = 30, mob = 6)
+    utils.data_processing_gold_table.process_fe_attr_gold_table(date_str, silver_fe_attr_directory, gold_fe_attr_directory, spark)
+    utils.data_processing_gold_table.process_fe_fin_gold_table(date_str, silver_fe_fin_directory, gold_fe_fin_directory, spark)
+    utils.data_processing_gold_table.process_fe_click_gold_table(date_str, silver_fe_click_directory, gold_fe_click_directory, spark)
 
 
 folder_path = gold_label_store_directory

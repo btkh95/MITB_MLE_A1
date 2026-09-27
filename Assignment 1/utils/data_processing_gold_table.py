@@ -15,28 +15,30 @@ from pyspark.sql.functions import col
 from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
 
 
-def process_labels_gold_table(snapshot_date_str, silver_loan_daily_directory, gold_label_store_directory, spark, dpd, mob):
+def process_lms_gold_table(snapshot_date_str, silver_loan_daily_directory, gold_label_store_directory, spark, dpd, mob):
     
     # prepare arguments
     snapshot_date = datetime.strptime(snapshot_date_str, "%Y-%m-%d")
     
-    # connect to silver table
+    # connect to silver LMS table
     partition_name = "silver_loan_daily_" + snapshot_date_str.replace('-','_') + '.parquet'
     filepath = silver_loan_daily_directory + partition_name
     df = spark.read.parquet(filepath)
     print('loaded from:', filepath, 'row count:', df.count())
 
-    # get customer at mob
+    # filter data: select loans at the target month on book
     df = df.filter(col("mob") == mob)
 
-    # get label
+    # augment data: add default label using the days-past-due threshold
     df = df.withColumn("label", F.when(col("dpd") >= dpd, 1).otherwise(0).cast(IntegerType()))
+
+    # augment data: add label definition (for example, 30dpd_6mob)
     df = df.withColumn("label_def", F.lit(str(dpd)+'dpd_'+str(mob)+'mob').cast(StringType()))
 
     # select columns to save
     df = df.select("loan_id", "Customer_ID", "label", "label_def", "snapshot_date")
 
-    # save gold table - IRL connect to database to write
+    # save gold LMS labels - IRL connect to database to write
     partition_name = "gold_label_store_" + snapshot_date_str.replace('-','_') + '.parquet'
     filepath = gold_label_store_directory + partition_name
     df.write.mode("overwrite").parquet(filepath)
@@ -44,4 +46,143 @@ def process_labels_gold_table(snapshot_date_str, silver_loan_daily_directory, go
     #           compression='gzip')
     print('saved to:', filepath)
     
+    return df
+
+
+def process_fe_attr_gold_table(snapshot_date_str, silver_fe_attr_directory, gold_fe_attr_directory, spark):
+    # prepare arguments
+    snapshot_date = datetime.strptime(snapshot_date_str, "%Y-%m-%d")
+
+    # connect to silver attribute table
+    partition_name = "silver_fe_attr_" + snapshot_date_str.replace('-','_') + '.parquet'
+    filepath = silver_fe_attr_directory + partition_name
+    df = spark.read.parquet(filepath)
+    print('loaded from:', filepath, 'row count:', df.count())
+
+    # augment data: flag missing occupation before filling the category
+    df = df.withColumn("occupation_missing", col("Occupation").isNull())
+
+    # transform data: represent missing occupation as an explicit category
+    df = df.fillna({"Occupation": "Unknown"})
+
+    # select columns to save: raw audit values remain available in silver
+    df = df.drop("Age_raw", "snapshot_date_raw")
+
+    # save gold table - IRL connect to database to write
+    partition_name = "gold_fe_attr_" + snapshot_date_str.replace('-','_') + '.parquet'
+    filepath = gold_fe_attr_directory + partition_name
+    df.write.mode("overwrite").parquet(filepath)
+    print('saved to:', filepath)
+
+    return df
+
+
+def process_fe_fin_gold_table(snapshot_date_str, silver_fe_fin_directory, gold_fe_fin_directory, spark):
+    # prepare arguments
+    snapshot_date = datetime.strptime(snapshot_date_str, "%Y-%m-%d")
+
+    # connect to silver financial table
+    partition_name = "silver_fe_fin_" + snapshot_date_str.replace('-','_') + '.parquet'
+    filepath = silver_fe_fin_directory + partition_name
+    df = spark.read.parquet(filepath)
+    print('loaded from:', filepath, 'row count:', df.count())
+
+    # augment data: compare annualized monthly salary with reported annual income
+    df = df.withColumn("months12_to_annual_income_ratio",
+        F.when(col("Annual_Income") > 0,
+               col("Monthly_Inhand_Salary") * 12 / col("Annual_Income")))
+
+    # augment data: calculate the share of monthly salary committed to installments
+    df = df.withColumn("EMI_to_Salary_Ratio",
+        F.when(col("Monthly_Inhand_Salary") > 0,
+               col("Total_EMI_per_month") / col("Monthly_Inhand_Salary")))
+
+    # augment data: calculate outstanding debt relative to annual income
+    df = df.withColumn("Debt_to_Income",
+        F.when(col("Annual_Income") > 0,
+               col("Outstanding_Debt") / col("Annual_Income")))
+
+    # augment data: calculate monthly salary remaining after installments and investments
+    df = df.withColumn("Disposable_Income",
+        col("Monthly_Inhand_Salary") - col("Total_EMI_per_month") - col("Amount_invested_monthly"))
+
+    # augment data: count each loan type, preserving repeated loans and unknown lists
+    # Fixed categories keep the output schema consistent between monthly partitions.
+    loan_types = [
+        "Auto Loan", "Credit-Builder Loan", "Debt Consolidation Loan",
+        "Home Equity Loan", "Mortgage Loan", "Not Specified", "Payday Loan",
+        "Personal Loan", "Student Loan"
+    ]
+    loans = F.transform(F.split(col("Type_of_Loan"), r",\s*"), lambda loan: F.trim(loan))
+    for loan_type in loan_types:
+        column_name = "Loan_" + loan_type.replace(" ", "_").replace("-", "_")
+        df = df.withColumn(column_name,
+            F.when(~col("loan_types_missing"),
+                F.size(F.filter(loans, lambda loan: loan == F.lit(loan_type)))))
+
+    # augment data: extract spending behaviour (High or Low)
+    df = df.withColumn("Spending_Behaviour", F.split(col("Payment_Behaviour"), "_")[0])
+
+    # augment data: extract payment size (Small, Medium or Large)
+    df = df.withColumn("Payments_Size", F.split(col("Payment_Behaviour"), "_")[2])
+
+    # transform data: represent missing categories without learning from future data
+    df = df.fillna({column: "Unknown" for column in [
+        "Credit_Mix", "Payment_of_Min_Amount", "Spending_Behaviour", "Payments_Size"
+    ]})
+
+    # augment data: add log features for nonnegative monetary values
+    # Keep original values; negative balances have a null log feature.
+    for column in ["Annual_Income", "Monthly_Inhand_Salary", "Outstanding_Debt",
+                   "Total_EMI_per_month", "Amount_invested_monthly", "Monthly_Balance"]:
+        df = df.withColumn(column + "_log1p",
+            F.when(col(column) >= 0, F.log1p(col(column))))
+
+    # select columns to save: source text and raw audit values remain in silver
+    df = df.drop("Num_of_Loan_raw", "snapshot_date_raw", "Type_of_Loan",
+                 "Payment_Behaviour", "Credit_History_Age")
+
+    # save gold table - IRL connect to database to write
+    partition_name = "gold_fe_fin_" + snapshot_date_str.replace('-','_') + '.parquet'
+    filepath = gold_fe_fin_directory + partition_name
+    df.write.mode("overwrite").parquet(filepath)
+    print('saved to:', filepath)
+
+    return df
+
+
+def process_fe_click_gold_table(snapshot_date_str, silver_fe_click_directory, gold_fe_click_directory, spark):
+    # prepare arguments
+    snapshot_date = datetime.strptime(snapshot_date_str, "%Y-%m-%d")
+
+    # connect to silver clickstream history
+    filepath = silver_fe_click_directory + "silver_fe_click_*.parquet"
+    df = spark.read.parquet(filepath)
+
+    # filter data: use only activity strictly before the feature snapshot date
+    # This snapshot can later be joined to a loan starting on the same date.
+    df = df.filter(col("snapshot_date") < F.lit(snapshot_date.date()))
+    print('loaded from:', filepath, 'historical row count:', df.count())
+
+    # augment data: calculate historical mean for each anonymous feature per customer
+    feature_columns = sorted(column for column in df.columns if column.startswith("fe_"))
+    aggregations = [F.mean(col(column)).alias(column + "_mean") for column in feature_columns]
+
+    # augment data: count distinct observed activity dates, not individual rows
+    aggregations.append(F.countDistinct("snapshot_date").alias("clickstream_days"))
+    df = df.groupBy("Customer_ID").agg(*aggregations)
+
+    # augment data: identify customers with prior clickstream activity
+    # Customers absent from this table need a zero flag after a downstream left join.
+    df = df.withColumn("has_clickstream", F.lit(1).cast(IntegerType()))
+
+    # augment data: record the feature cutoff date for point-in-time joins
+    df = df.withColumn("snapshot_date", F.lit(snapshot_date.date()).cast(DateType()))
+
+    # save gold table - IRL connect to database to write
+    partition_name = "gold_fe_click_" + snapshot_date_str.replace('-','_') + '.parquet'
+    filepath = gold_fe_click_directory + partition_name
+    df.write.mode("overwrite").parquet(filepath)
+    print('saved to:', filepath)
+
     return df
