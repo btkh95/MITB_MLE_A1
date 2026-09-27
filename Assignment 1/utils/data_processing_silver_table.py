@@ -67,21 +67,40 @@ def process_lms_silver_table(snapshot_date_str, bronze_lms_directory, silver_loa
     return df
 
 def process_fe_click_silver_table(snapshot_date_str, bronze_fe_click_directory, silver_fe_click_directory, spark):
-    # read the date partition and type the anonymous features
-    partition_name = "bronze_" + snapshot_date_str.replace('-', '_') + '.csv'
-    df = spark.read.csv(bronze_fe_click_directory + partition_name, header=True, inferSchema=False)
+    # prepare arguments
+    snapshot_date = datetime.strptime(snapshot_date_str, "%Y-%m-%d")
+
+    # connect to bronze table
+    partition_name = "bronze_" + snapshot_date_str.replace('-','_') + '.csv'
+    filepath = bronze_fe_click_directory + partition_name
+    df = spark.read.csv(filepath, header=True, inferSchema=False)
     input_count = df.count()
-    for column in df.columns:
-        if column.startswith("fe_"):
-            df = df.withColumn(column, F.expr(f"try_cast(`{column}` as int)"))
-    df = df.withColumn("snapshot_date", F.expr("try_cast(snapshot_date as date)"))
+    print('loaded from:', filepath, 'row count:', input_count)
+
+    # clean data: enforce schema / data type
+    # Dictionary specifying columns and their desired datatypes
+    column_type_map = {
+        "Customer_ID": StringType(),
+        **{column: IntegerType() for column in df.columns if column.startswith("fe_")},
+        "snapshot_date": DateType(),
+    }
+
+    for column, data_type in column_type_map.items():
+        df = df.withColumn(column, F.expr(
+            f"try_cast(`{column}` as {data_type.simpleString()})"))
+
+    # clean data: remove duplicate rows
     df = df.dropDuplicates()
     output_count = df.count()
     print(snapshot_date_str, "clickstream rows:", input_count,
           "duplicates removed:", input_count - output_count)
-    filepath = silver_fe_click_directory + "silver_fe_click_" + snapshot_date_str.replace('-', '_') + '.parquet'
+
+    # save silver table - IRL connect to database to write
+    partition_name = "silver_fe_click_" + snapshot_date_str.replace('-','_') + '.parquet'
+    filepath = silver_fe_click_directory + partition_name
     df.write.mode("overwrite").parquet(filepath)
     print('saved to:', filepath)
+
     return df
 
 
@@ -103,20 +122,32 @@ def process_fe_attr_silver_table(snapshot_date_str, bronze_fe_attr_directory, si
     # print out the dropped PII columns and the row count after dropping
     print('dropped PII columns:', pii_columns, 'row count:', df.count())
 
-    # clean before casting; keep customers even when a field is invalid
+    # augment data: preserve the original age before cleaning
     df = df.withColumn("Age_raw", col("Age"))
+
+    # clean data: remove trailing underscores and convert age to integer
     df = df.withColumn("Age", F.regexp_replace(F.trim(col("Age")), r"_+$", ""))
     df = df.withColumn("Age", F.expr("try_cast(Age as int)"))
+
+    # augment data: flag missing ages and ages outside 1-100
     df = df.withColumn("age_invalid", col("Age").isNull() | ~col("Age").between(1, 100))
+
+    # clean data: replace invalid ages with null while retaining the customer
     df = df.withColumn("Age", F.when(~col("age_invalid"), col("Age")))
+
+    # clean data: trim occupation and replace blank/underscore placeholders with null
     df = df.withColumn("Occupation", F.trim(col("Occupation")))
     df = df.withColumn("Occupation",
         F.when(col("Occupation").isNull() | (col("Occupation") == "") |
                col("Occupation").rlike(r"^_+$"), F.lit(None))
          .otherwise(col("Occupation")))
+    # augment data: preserve the original snapshot date before conversion
     df = df.withColumn("snapshot_date_raw", col("snapshot_date"))
+
+    # clean data: convert snapshot date to date type; invalid values become null
     df = df.withColumn("snapshot_date", F.expr("try_cast(snapshot_date as date)"))
 
+    # report data quality: count invalid ages and missing occupations
     print("attribute quality:", df.select(
         F.count("*").alias("rows"),
         F.sum(col("age_invalid").cast("int")).alias("invalid_age"),
@@ -143,11 +174,13 @@ def process_fe_fin_silver_table(snapshot_date_str, bronze_fe_fin_directory, silv
     df = spark.read.csv(filepath, header=True, inferSchema=False)
     print('loaded from:', filepath, 'row count:', df.count())
 
-    # retain the original count and date for tracing invalid values
+    # augment data: preserve the original loan count before cleaning
     df = df.withColumn("Num_of_Loan_raw", col("Num_of_Loan"))
+
+    # augment data: preserve the original snapshot date before conversion
     df = df.withColumn("snapshot_date_raw", col("snapshot_date"))
 
-    # remove surrounding underscores before numeric conversion; preserve minus signs
+    # clean data: remove surrounding underscores from numeric values; preserve minus signs
     numeric_columns = [
         "Annual_Income", "Monthly_Inhand_Salary", "Num_Bank_Accounts",
         "Num_Credit_Card", "Interest_Rate", "Num_of_Loan",
@@ -158,7 +191,9 @@ def process_fe_fin_silver_table(snapshot_date_str, bronze_fe_fin_directory, silv
     for column in numeric_columns:
         df = df.withColumn(column, F.regexp_replace(F.trim(col(column)), r"^_+|_+$", ""))
 
-    # money and ratios retain decimal precision; categories remain strings
+    # clean data: enforce schema / data type
+    # Dictionary specifying columns and their desired datatypes
+    # Money and ratios retain decimal precision; categories remain strings.
     column_type_map = {
         "Customer_ID": StringType(),
         "Annual_Income": DoubleType(),
@@ -187,38 +222,49 @@ def process_fe_fin_silver_table(snapshot_date_str, bronze_fe_fin_directory, silv
         df = df.withColumn(column, F.expr(
             f"try_cast(`{column}` as {data_type.simpleString()})"))
 
-    # compare every listed loan, including repetitions; a missing list is unknown
+    # clean data: standardize loan-list separators and replace empty lists with null
     df = df.withColumn("Type_of_Loan",
         F.regexp_replace(F.trim(col("Type_of_Loan")), r",\s*and\s+", ", "))
     df = df.withColumn("Type_of_Loan",
         F.when(F.length(col("Type_of_Loan")) > 0, col("Type_of_Loan")))
+
+    # augment data: flag missing loan lists
     df = df.withColumn("loan_types_missing", col("Type_of_Loan").isNull())
+
+    # augment data: count listed loans, including repetitions
+    # missing lists -> null
     df = df.withColumn("listed_loan_count",
         F.when(~col("loan_types_missing"),
             F.size(F.filter(F.split(col("Type_of_Loan"), r",\s*"),
                             lambda loan: F.length(F.trim(loan)) > 0))))
 
-    # Flag mismatches
-    # Missing lists do not establish zero loans. Keep plausible zero counts.
+    # augment data: classify loan counts as invalid, missing list, match, or mismatch
     df = df.withColumn("loan_count_status",
         F.when(col("Num_of_Loan").isNull() | (col("Num_of_Loan") < 0), "Invalid count")
          .when(col("loan_types_missing"), "Missing loan list")
          .when(col("Num_of_Loan") == col("listed_loan_count"), "Match")
          .otherwise("Mismatch"))
+
+    # augment data: flag invalid/mismatched counts or positive counts without a loan list
     df = df.withColumn("loan_count_suspicious",
         (col("loan_count_status") == "Invalid count") |
         (col("loan_count_status") == "Mismatch") |
         (col("loan_types_missing") & (col("Num_of_Loan") > 0)))
+
+    # clean data: null suspicious loan counts; retain zero counts with missing lists
     df = df.withColumn("Num_of_Loan",
         F.when(~col("loan_count_suspicious"), col("Num_of_Loan")))
 
-    # Keep 0-34 interest-rate, null for anything else
+    # augment data: flag missing interest rates and rates outside 0-34
     df = df.withColumn("interest_rate_invalid",
         col("Interest_Rate").isNull() | ~col("Interest_Rate").between(0, 34))
+
+    # clean data: replace invalid interest rates with null
     df = df.withColumn("Interest_Rate",
         F.when(~col("interest_rate_invalid"), col("Interest_Rate")))
 
-    # Nonnegative quantities; negative delay and credit-limit change can be meaningful.
+    # clean data: replace negative quantities with null
+    # Negative delay and credit-limit change can be meaningful, so exclude them.
     nonnegative_columns = [
         "Annual_Income", "Monthly_Inhand_Salary", "Num_Bank_Accounts",
         "Num_Credit_Card", "Num_of_Delayed_Payment", "Num_Credit_Inquiries",
@@ -227,24 +273,30 @@ def process_fe_fin_silver_table(snapshot_date_str, bronze_fe_fin_directory, silv
     for column in nonnegative_columns:
         df = df.withColumn(column, F.when(col(column) >= 0, col(column)))
 
-    # Standardize categorical placeholders without guessing missing information.
+    # clean data: retain Standard, Good, or Bad credit mix; null other values
     df = df.withColumn("Credit_Mix",
         F.when(F.trim(col("Credit_Mix")).isin("Standard", "Good", "Bad"),
                F.trim(col("Credit_Mix"))))
+
+    # clean data: retain Yes/No minimum-payment responses; null other values
     df = df.withColumn("Payment_of_Min_Amount",
         F.when(F.trim(col("Payment_of_Min_Amount")).isin("Yes", "No"),
                F.trim(col("Payment_of_Min_Amount"))))
+
+    # clean data: retain recognized spending/payment-size categories; null other values
     df = df.withColumn("Payment_Behaviour",
         F.when(col("Payment_Behaviour").rlike(
             r"^(High|Low)_spent_(Small|Medium|Large)_value_payments$"),
             col("Payment_Behaviour")))
 
-    # Keep the original text and add a duration in months.
+    # augment data: convert credit history to total months while keeping the original text
+    # Example: '2 Years and 3 Months' becomes 27; unrecognized formats become null.
     df = df.withColumn("Credit_History_Months",
         F.when(col("Credit_History_Age").rlike(r"^\d+ Years? and \d+ Months?$"),
             F.regexp_extract(col("Credit_History_Age"), r"^(\d+)", 1).cast("int") * 12 +
             F.regexp_extract(col("Credit_History_Age"), r"and (\d+)", 1).cast("int")))
 
+    # report data quality: count suspicious loans, missing lists, invalid rates and dates
     print("financial quality:", df.select(
         F.count("*").alias("rows"),
         F.sum(col("loan_count_suspicious").cast("int")).alias("suspicious_loan_counts"),
