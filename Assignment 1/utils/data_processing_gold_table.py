@@ -15,6 +15,17 @@ from pyspark.sql.functions import col
 from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
 
 
+def _validate_join_keys(df, keys, table_name):
+    # Reject ambiguous joins rather than multiplying rows or choosing arbitrary records.
+    missing_key = col(keys[0]).isNull()
+    for key in keys[1:]:
+        missing_key = missing_key | col(key).isNull()
+    if df.filter(missing_key).limit(1).count():
+        raise ValueError(f"{table_name}: null join keys in {keys}")
+    if df.groupBy(*keys).count().filter(col("count") > 1).limit(1).count():
+        raise ValueError(f"{table_name}: duplicate join keys in {keys}")
+
+
 def process_lms_gold_table(snapshot_date_str, silver_loan_daily_directory, gold_label_store_directory, spark, dpd, mob):
     
     # prepare arguments
@@ -35,8 +46,9 @@ def process_lms_gold_table(snapshot_date_str, silver_loan_daily_directory, gold_
     # augment data: add label definition (for example, 30dpd_6mob)
     df = df.withColumn("label_def", F.lit(str(dpd)+'dpd_'+str(mob)+'mob').cast(StringType()))
 
-    # select columns to save
-    df = df.select("loan_id", "Customer_ID", "label", "label_def", "snapshot_date")
+    # keep loan_start_date so gold features can be matched to the application date
+    df = df.select("loan_id", "Customer_ID", "loan_start_date",
+                   "label", "label_def", "snapshot_date")
 
     # save gold LMS labels - IRL connect to database to write
     partition_name = "gold_label_store_" + snapshot_date_str.replace('-','_') + '.parquet'
@@ -184,5 +196,38 @@ def process_fe_click_gold_table(snapshot_date_str, silver_fe_click_directory, go
     filepath = gold_fe_click_directory + partition_name
     df.write.mode("overwrite").parquet(filepath)
     print('saved to:', filepath)
+
+    return df
+
+
+def process_features_gold_table(gold_feature_store_directory, spark):
+    # connect to gold feature tables using explicit patterns to avoid reading joined outputs
+    attr_df = spark.read.parquet(gold_feature_store_directory + "fe_attr/gold_fe_attr_*.parquet")
+    fin_df = spark.read.parquet(gold_feature_store_directory + "fe_fin/gold_fe_fin_*.parquet")
+    click_df = spark.read.parquet(gold_feature_store_directory + "fe_click/gold_fe_click_*.parquet")
+
+    # validate data: each feature source must have one row per customer and feature date
+    keys = ["Customer_ID", "snapshot_date"]
+    for name, source in [("attributes", attr_df), ("financials", fin_df), ("clickstream", click_df)]:
+        _validate_join_keys(source, keys, name)
+
+    # augment data: distinguish a missing source row from missing individual fields
+    attr_df = attr_df.withColumn("has_attributes", F.lit(1).cast(IntegerType()))
+    fin_df = fin_df.withColumn("has_financials", F.lit(1).cast(IntegerType()))
+
+    # join data: preserve customers present in either attributes or financials
+    df = attr_df.join(fin_df, on=keys, how="outer")
+
+    # join data: match historical clickstream at the same feature cutoff date
+    df = df.join(click_df, on=keys, how="left")
+
+    # clean data: absent history is zero observations; unknown numeric features -> null
+    df = df.fillna({"has_attributes": 0, "has_financials": 0,
+                    "has_clickstream": 0, "clickstream_days": 0})
+
+    # save gold feature store - one row per customer and feature date
+    filepath = gold_feature_store_directory + "gold_joined_features.parquet"
+    df.write.mode("overwrite").parquet(filepath)
+    print('saved to:', filepath, 'row count:', df.count())
 
     return df
