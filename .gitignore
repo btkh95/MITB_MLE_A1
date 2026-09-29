@@ -1,5 +1,4 @@
 # Data files and generated outputs
-*.csv
 *.parquet
 datamart/
 model_bank/
