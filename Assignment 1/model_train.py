@@ -1,18 +1,22 @@
-"""Make train, test and out-of-time datasets from gold tables."""
+"""Model sanity check: make train, test and out-of-time datasets from the gold stores.
+
+Run after main.py has built the datamart:  python model_train.py
+"""
 
 import math
 import os
+import pickle
 
-import numpy as np
 import pandas as pd
+import pyspark
 from pyspark.sql import functions as F
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 
 def process_model_splits(feature_directory, label_directory, output_directory,
-                         spark, oot_fraction=0.2, test_size=0.2,
-                         random_state=55):
+                         model_bank_directory, spark, oot_fraction=0.2,
+                         test_size=0.2, random_state=55):
     # 1. Join labels to features from the date the loan started.
     # The label date is later, so keep it separate from the feature date.
     labels = spark.read.parquet(label_directory + "gold_label_store_*.parquet")
@@ -36,43 +40,32 @@ def process_model_splits(feature_directory, label_directory, output_directory,
                                    random_state=random_state, stratify=earlier.label)
 
     # 3. IDs, dates and labels are for joins/audits, not model predictors.
-    # Repayment outcomes from LMS must also stay out of the feature set.
     metadata_columns = ["loan_id", "Customer_ID", "loan_start_date",
                         "feature_snapshot_date", "label_snapshot_date", "label_def", "label"]
-    outcome_columns = ["dpd", "mob", "paid_amt", "overdue_amt",
-                       "installments_missed", "first_missed_date"]
-    feature_columns = [c for c in data.columns
-                       if c not in metadata_columns + outcome_columns]
+    feature_columns = [c for c in data.columns if c not in metadata_columns]
     X_train = train[feature_columns].copy()
     X_test = test[feature_columns].copy()
     X_oot = oot[feature_columns].copy()
     numeric_columns = [c for c in feature_columns if pd.api.types.is_numeric_dtype(X_train[c])]
     categorical_columns = [c for c in feature_columns if c not in numeric_columns]
 
-    # 4. Using TRAIN only:mean for age/counts, mean among clickers for fe_*_mean, median otherwise.
+    # 4. Using TRAIN only: mean for age/counts, mean among clickers for fe_*_mean, median otherwise.
     mean_columns = ["Age", "Num_Bank_Accounts", "Num_Credit_Card",
                     "Num_of_Loan", "Num_of_Delayed_Payment"]
     click_columns = [c for c in numeric_columns if c.startswith("fe_") and c.endswith("_mean")]
+    fill_values = {}
     for column in numeric_columns:
-        for X in [X_train, X_test, X_oot]:
-            X[column] = pd.to_numeric(X[column], errors="coerce").astype(float)
-            X[column] = X[column].replace([np.inf, -np.inf], np.nan)
-        if X_train[column].notna().sum() == 0:
-            value = 0.0
-        elif column in mean_columns:
-            value = X_train[column].mean()
+        if column in mean_columns:
+            fill_values[column] = X_train[column].mean()
         elif column in click_columns:
-            value = X_train.loc[train["has_clickstream"] == 1, column].mean()
+            fill_values[column] = X_train.loc[train["has_clickstream"] == 1, column].mean()
         else:
-            value = X_train[column].median()
-        value = float(value) if pd.notna(value) else 0.0
-        for X in [X_train, X_test, X_oot]:
-            X[column] = X[column].fillna(value)
+            fill_values[column] = X_train[column].median()
+    for X in [X_train, X_test, X_oot]:
+        X[numeric_columns] = X[numeric_columns].fillna(fill_values)
 
     # 5. Turn categories into 0/1 columns. Test and OOT use the same columns
     # as training; a category seen only later does not add a new column.
-    for X in [X_train, X_test, X_oot]:
-        X[categorical_columns] = X[categorical_columns].fillna("Unknown")
     X_train = pd.get_dummies(X_train, columns=categorical_columns, dtype=int)
     X_test = pd.get_dummies(X_test, columns=categorical_columns, dtype=int)
     X_oot = pd.get_dummies(X_oot, columns=categorical_columns, dtype=int)
@@ -80,15 +73,29 @@ def process_model_splits(feature_directory, label_directory, output_directory,
     X_oot = X_oot.reindex(columns=X_train.columns, fill_value=0)
 
     # 6. Fit StandardScaler() on TRAIN numeric values, then reuse it for
-    # test and OOT. Keep the 0/1 columns unchanged.
-    scale_columns = [c for c in numeric_columns
-                     if not pd.api.types.is_bool_dtype(train[c])]
+    # test and OOT. Keep the True/False flag columns unchanged.
+    scale_columns = [c for c in numeric_columns if not pd.api.types.is_bool_dtype(train[c])]
     scaler = StandardScaler()
     X_train[scale_columns] = scaler.fit_transform(X_train[scale_columns])
     X_test[scale_columns] = scaler.transform(X_test[scale_columns])
     X_oot[scale_columns] = scaler.transform(X_oot[scale_columns])
 
-    # 7. Save three datasets. Loan IDs, dates and labels stay in the files
+    # 7. Save the fitted preprocessing so new loans can be prepared the same way
+    # at prediction time.
+    os.makedirs(model_bank_directory, exist_ok=True)
+    preprocessor = {
+        "fill_values": fill_values,
+        "categorical_columns": categorical_columns,
+        "model_columns": list(X_train.columns),
+        "scale_columns": scale_columns,
+        "scaler": scaler,
+    }
+    filepath = model_bank_directory + "preprocessor.pkl"
+    with open(filepath, "wb") as file:
+        pickle.dump(preprocessor, file)
+    print("saved to:", filepath)
+
+    # 8. Save three datasets. Loan IDs, dates and labels stay in the files
     # for inspection; they are not model predictors.
     os.makedirs(output_directory, exist_ok=True)
     for name, rows, X in [("train", train, X_train),
@@ -101,3 +108,16 @@ def process_model_splits(feature_directory, label_directory, output_directory,
             output_directory + name + ".parquet")
         print(name, "rows:", len(rows), "default rate:", round(rows.label.mean(), 3))
     print("OOT cutoff:", str(pd.Timestamp(oot_cutoff).date()))
+
+
+if __name__ == "__main__":
+    spark = pyspark.sql.SparkSession.builder \
+        .appName("model_train") \
+        .master("local[*]") \
+        .getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")
+
+    process_model_splits("datamart/gold/feature_store/", "datamart/gold/label_store/",
+                         "datamart/model_data/", "model_bank/", spark)
+
+    spark.stop()

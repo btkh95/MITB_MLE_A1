@@ -16,7 +16,7 @@ from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
 import utils.data_processing_bronze_table
 import utils.data_processing_silver_table
 import utils.data_processing_gold_table
-import utils.data_processing_model_data
+import utils.static_yaml
 from utils.check_data_files import check_data_files
 
 import yaml
@@ -34,7 +34,7 @@ spark.sparkContext.setLogLevel("ERROR")
 snapshot_date_str = "2023-01-01"
 
 start_date_str = "2023-01-01"
-end_date_str = "2024-12-01"
+end_date_str = "2024-12-01" # attributes and financials are only available till Jan 2025 in the source data
 
 # generate list of dates to process
 def generate_first_of_month_dates(start_date_str, end_date_str):
@@ -117,6 +117,10 @@ for date_str in dates_str_lst:
     utils.data_processing_silver_table.process_fe_fin_silver_table(date_str, bronze_fe_fin_directory, silver_fe_fin_directory, spark)
     utils.data_processing_silver_table.process_fe_click_silver_table(date_str, bronze_fe_click_directory, silver_fe_click_directory, spark)
 
+# update static loan types from the cleaned silver loan lists; gold reads this file
+loan_types = utils.static_yaml.get_loan_types(silver_fe_fin_directory, spark)
+utils.static_yaml.write_static_yaml("loan_types.yaml", {"Type_of_Loan": loan_types})
+
 ########
 # Gold #
 ########
@@ -143,13 +147,7 @@ for date_str in dates_str_lst:
 # assemble the feature store after every monthly feature partition is available
 utils.data_processing_gold_table.process_features_gold_table(gold_feature_store_directory, spark)
 
-# Decision: keep main.py as the pipeline orchestrator. Use the latest 20% of
-# application months for OOT; stratify an 80/20 train/test split on older loans.
-# The helper uses training means (including clickstream means from clickers),
-# training medians, one-hot encoding and StandardScaler() on train only.
-utils.data_processing_model_data.process_model_splits(
-    gold_feature_store_directory, gold_label_store_directory,
-    "datamart/gold/post_split/", spark, oot_fraction=0.2, test_size=0.2, random_state=55)
+# train/test/OOT splits and model preprocessing are in model_train.py, not the data pipeline
 
 folder_path = gold_label_store_directory
 files_list = [folder_path+os.path.basename(f) for f in glob.glob(os.path.join(folder_path, 'gold_label_store_*.parquet'))]
