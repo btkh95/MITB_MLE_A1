@@ -10,10 +10,11 @@ import pprint
 import pyspark
 import pyspark.sql.functions as F
 import argparse
-import yaml
 
 from pyspark.sql.functions import col
 from pyspark.sql.types import StringType, IntegerType, FloatType, DateType, DoubleType
+
+from utils.static_yaml import read_static_yaml
 
 
 def process_lms_silver_table(snapshot_date_str, bronze_lms_directory, silver_loan_daily_directory, spark):
@@ -115,8 +116,7 @@ def process_fe_attr_silver_table(snapshot_date_str, bronze_fe_attr_directory, si
     print('loaded from:', filepath, 'row count:', df.count())
 
     # drop PII columns - will never be used in modeling, and should not be stored in silver table
-    with open("static/pii.yaml", encoding="utf-8") as file:
-        pii_columns = yaml.safe_load(file)["pii"]
+    pii_columns = read_static_yaml("pii.yaml")["pii"]
     df = df.drop(*pii_columns)
 
     # print out the dropped PII columns and the row count after dropping
@@ -191,6 +191,10 @@ def process_fe_fin_silver_table(snapshot_date_str, bronze_fe_fin_directory, silv
     for column in numeric_columns:
         df = df.withColumn(column, F.regexp_replace(F.trim(col(column)), r"^_+|_+$", ""))
 
+    # clean data: Num_Credit_Inquiries is stored as '4.0'; remove the '.0' so it casts to integer
+    df = df.withColumn("Num_Credit_Inquiries",
+        F.regexp_replace(col("Num_Credit_Inquiries"), r"\.0$", ""))
+
     # clean data: enforce schema / data type
     # Dictionary specifying columns and their desired datatypes
     # Money and ratios retain decimal precision; categories remain strings.
@@ -255,23 +259,38 @@ def process_fe_fin_silver_table(snapshot_date_str, bronze_fe_fin_directory, silv
     df = df.withColumn("Num_of_Loan",
         F.when(~col("loan_count_suspicious"), col("Num_of_Loan")))
 
-    # augment data: flag missing interest rates and rates outside 0-34
-    df = df.withColumn("interest_rate_invalid",
-        col("Interest_Rate").isNull() | ~col("Interest_Rate").between(0, 34))
-
-    # clean data: replace invalid interest rates with null
-    df = df.withColumn("Interest_Rate",
-        F.when(~col("interest_rate_invalid"), col("Interest_Rate")))
-
     # clean data: replace negative quantities with null
     # Negative delay and credit-limit change can be meaningful, so exclude them.
+    # Columns with a valid range in static/valid_ranges.yaml are handled below.
     nonnegative_columns = [
-        "Annual_Income", "Monthly_Inhand_Salary", "Num_Bank_Accounts",
-        "Num_Credit_Card", "Num_of_Delayed_Payment", "Num_Credit_Inquiries",
-        "Outstanding_Debt", "Total_EMI_per_month", "Amount_invested_monthly"
+        "Monthly_Inhand_Salary", "Outstanding_Debt", "Amount_invested_monthly"
     ]
     for column in nonnegative_columns:
         df = df.withColumn(column, F.when(col(column) >= 0, col(column)))
+
+    # clean data: replace the Amount_invested_monthly placeholder (__10000__) with null
+    df = df.withColumn("Amount_invested_monthly",
+        F.when(col("Amount_invested_monthly") != 10000, col("Amount_invested_monthly")))
+
+    # clean data: replace the Monthly_Balance placeholder (about -3.3e26) with null
+    df = df.withColumn("Monthly_Balance",
+        F.when(col("Monthly_Balance") > -1e9, col("Monthly_Balance")))
+
+    # augment data: flag missing values and values outside the valid ranges
+    # clean data: replace flagged values with null
+    valid_ranges = read_static_yaml("valid_ranges.yaml")
+    for column, (low, high) in valid_ranges["value_ranges"].items():
+        flag = column.lower() + "_invalid"
+        df = df.withColumn(flag, col(column).isNull() | ~col(column).between(low, high))
+        df = df.withColumn(column, F.when(~col(flag), col(column)))
+
+    # augment data: flag values outside the valid ratio to monthly salary
+    # clean data: replace flagged values with null
+    for column, (low, high) in valid_ranges["salary_ratio_ranges"].items():
+        flag = column.lower() + "_invalid"
+        df = df.withColumn(flag, col(column).isNull() |
+            ~(col(column) / col("Monthly_Inhand_Salary")).between(low, high))
+        df = df.withColumn(column, F.when(~col(flag), col(column)))
 
     # clean data: retain Standard, Good, or Bad credit mix; null other values
     df = df.withColumn("Credit_Mix",
@@ -296,12 +315,13 @@ def process_fe_fin_silver_table(snapshot_date_str, bronze_fe_fin_directory, silv
             F.regexp_extract(col("Credit_History_Age"), r"^(\d+)", 1).cast("int") * 12 +
             F.regexp_extract(col("Credit_History_Age"), r"and (\d+)", 1).cast("int")))
 
-    # report data quality: count suspicious loans, missing lists, invalid rates and dates
+    # report data quality: count suspicious loans, missing lists, invalid values and dates
+    invalid_columns = [column for column in df.columns if column.endswith("_invalid")]
     print("financial quality:", df.select(
         F.count("*").alias("rows"),
         F.sum(col("loan_count_suspicious").cast("int")).alias("suspicious_loan_counts"),
         F.sum(col("loan_types_missing").cast("int")).alias("missing_loan_lists"),
-        F.sum(col("interest_rate_invalid").cast("int")).alias("invalid_interest_rates"),
+        *[F.sum(col(column).cast("int")).alias(column) for column in invalid_columns],
         F.sum(col("snapshot_date").isNull().cast("int")).alias("invalid_dates")
     ).first().asDict())
 
