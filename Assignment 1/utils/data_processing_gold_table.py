@@ -14,6 +14,8 @@ import argparse
 from pyspark.sql.functions import col
 from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
 
+from utils.static_yaml import read_static_yaml
+
 
 def _validate_join_keys(df, keys, table_name):
     # Reject ambiguous joins rather than multiplying rows or choosing arbitrary records.
@@ -119,12 +121,8 @@ def process_fe_fin_gold_table(snapshot_date_str, silver_fe_fin_directory, gold_f
         col("Monthly_Inhand_Salary") - col("Total_EMI_per_month") - col("Amount_invested_monthly"))
 
     # augment data: count each loan type, preserving repeated loans and unknown lists
-    # Fixed categories keep the output schema consistent between monthly partitions.
-    loan_types = [
-        "Auto Loan", "Credit-Builder Loan", "Debt Consolidation Loan",
-        "Home Equity Loan", "Mortgage Loan", "Not Specified", "Payday Loan",
-        "Personal Loan", "Student Loan"
-    ]
+    # Fixed categories from static/loan_types.yaml keep the schema consistent between monthly partitions.
+    loan_types = read_static_yaml("loan_types.yaml")["Type_of_Loan"]
     loans = F.transform(F.split(col("Type_of_Loan"), r",\s*"), lambda loan: F.trim(loan))
     for loan_type in loan_types:
         column_name = "Loan_" + loan_type.replace(" ", "_").replace("-", "_")
