@@ -1,10 +1,11 @@
-# Generated data files and Spark Parquet output directories
+# Data files and generated outputs
 *.csv
 *.parquet
 datamart/
-__pycache__/
 model_bank/
-artifacts/**
 /artifacts/
+
+# Notebook checkpoints and Python caches
 .ipynb_checkpoints/
 __pycache__/
+*.py[cod]
